@@ -18,6 +18,7 @@
 
 import fsPromises from "node:fs/promises";
 import path from "node:path";
+import pLimit from "p-limit";
 import { generateText, streamText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
@@ -109,6 +110,16 @@ export interface StandaloneLLMConfig {
    * 透传给调用方,只是"以流式协议请求上游后等待完整文本"的兼容层。
    */
   stream?: boolean;
+  /**
+   * 分钟级总请求上限（默认 60）。0 表示不限。
+   * 由 runner 在内部做滑动窗口限流。
+   */
+  rateLimitPerMinute?: number;
+  /**
+   * 最大并发 LLM 调用数（默认 6）。
+   * 由 runner 在内部做信号量限流。
+   */
+  maxConcurrentCalls?: number;
 }
 
 // ============================
@@ -258,13 +269,11 @@ export class StandaloneLLMRunner implements LLMRunner {
   private enableTools: boolean;
   private stream: boolean;
   private logger?: Logger;
-
-  /**
-   * Side-channel: 最近一次 run() 调用的 token usage。
-   * 由 MetricTrackingRunner 装饰器读取，用于精确上报 credit。
-   * 不改变 LLMRunner 接口签名。
-   */
   lastUsage?: LLMUsage;
+  private readonly rateLimitPerMinute: number;
+  private readonly maxConcurrentCalls: number;
+  private readonly limit: ReturnType<typeof pLimit>;
+  private readonly rateTimestamps: number[];
 
   constructor(opts: {
     config: StandaloneLLMConfig;
@@ -278,6 +287,10 @@ export class StandaloneLLMRunner implements LLMRunner {
     this.enableTools = opts.enableTools ?? false;
     this.stream = opts.stream ?? opts.config.stream ?? false;
     this.logger = opts.logger;
+    this.rateLimitPerMinute = opts.config.rateLimitPerMinute ?? 60;
+    this.maxConcurrentCalls = opts.config.maxConcurrentCalls ?? 6;
+    this.limit = pLimit(this.maxConcurrentCalls);
+    this.rateTimestamps = [];
   }
 
   async run(params: LLMRunParams): Promise<string> {
@@ -295,7 +308,7 @@ export class StandaloneLLMRunner implements LLMRunner {
 
     this.logger?.debug?.(
       `${TAG} run() start: taskId=${params.taskId}, model=${this.model}, ` +
-      `tools=${effectiveEnableTools}${callerProvidedTools ? "(caller)" : ""}, timeout=${timeoutMs}ms`,
+        `tools=${effectiveEnableTools}${callerProvidedTools ? "(caller)" : ""}, timeout=${timeoutMs}ms`,
     );
 
     // Create OpenAI-compatible provider via AI SDK
@@ -355,27 +368,33 @@ export class StandaloneLLMRunner implements LLMRunner {
         },
       };
 
+      // Ponytail rate-limit gate: minute quota + max-concurrency semaphore.
+      // This prevents 429 storms and keeps in-flight LLM calls bounded.
+      await this.limit(() => this.ensureRateLimit());
+
       // stream=true → streamText(给只吃流式的上游);否则 generateText。
       // 读 totalUsage 而不是单 step 的 usage —— tool-call 多 step 时后者只报最后一步,
       // 会漏掉前序工具调用请求的用量,导致 credit 计费偏低。
       // ai@6.0.164 的字段是 inputTokens/outputTokens/totalTokens。
-      const { text, usage, steps } = this.stream
-        ? await (async () => {
-            const streamResult = streamText(callParams);
-            return {
-              text: ((await streamResult.text) ?? "").trim(),
-              usage: await streamResult.totalUsage,
-              steps: await streamResult.steps,
-            };
-          })()
-        : await (async () => {
-            const genResult = await generateText(callParams);
-            return {
-              text: (genResult.text ?? "").trim(),
-              usage: genResult.totalUsage,
-              steps: genResult.steps,
-            };
-          })();
+      const { text, usage, steps } = await this.limit(() =>
+        this.stream
+          ? (async () => {
+              const streamResult = streamText(callParams);
+              return {
+                text: ((await streamResult.text) ?? "").trim(),
+                usage: await streamResult.totalUsage,
+                steps: await streamResult.steps,
+              };
+            })()
+          : (async () => {
+              const genResult = await generateText(callParams);
+              return {
+                text: (genResult.text ?? "").trim(),
+                usage: genResult.totalUsage,
+                steps: genResult.steps,
+              };
+            })(),
+      );
 
       const totalMs = Date.now() - runStartMs;
 
@@ -457,6 +476,27 @@ export class StandaloneLLMRunner implements LLMRunner {
 
       throw err;
     }
+  }
+
+  private async ensureRateLimit(): Promise<void> {
+    if (this.rateLimitPerMinute <= 0) return;
+    const now = Date.now();
+    const windowMs = 60_000;
+    // Drop timestamps older than the window
+    const cutoff = now - windowMs;
+    while (this.rateTimestamps.length && this.rateTimestamps[0] < cutoff) {
+      this.rateTimestamps.shift();
+    }
+    if (this.rateTimestamps.length >= this.rateLimitPerMinute) {
+      const oldest = this.rateTimestamps[0];
+      const waitMs = windowMs - (now - oldest) + 20;
+      this.logger?.warn?.(
+        `${TAG} rate limit reached (${this.rateLimitPerMinute}/min), sleeping ${Math.max(waitMs, 0)}ms`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
+      return this.ensureRateLimit();
+    }
+    this.rateTimestamps.push(Date.now());
   }
 }
 

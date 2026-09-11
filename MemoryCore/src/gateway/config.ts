@@ -601,6 +601,14 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
       if (envVal !== undefined) return envVal === "true";
       return bool(llmConfig, "stream") ?? false;
     })(),
+    rateLimitPerMinute:
+      envInt("TDAI_LLM_RATE_LIMIT_PER_MINUTE") ??
+      num(llmConfig, "rateLimitPerMinute") ??
+      60,
+    maxConcurrentCalls:
+      envInt("TDAI_LLM_MAX_CONCURRENT_CALLS") ??
+      num(llmConfig, "maxConcurrentCalls") ??
+      6,
   };
 
   // Memory config (reuse the plugin's parseConfig for full compatibility)
