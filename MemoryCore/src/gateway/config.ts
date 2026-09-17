@@ -582,8 +582,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   const llmConfig = obj(fileConfig, "llm");
   const llmProxyConfig = obj(llmConfig, "proxy");
   const rawLlmProvider = env("TDAI_LLM_PROVIDER") ?? str(llmConfig, "provider");
-  const llmProvider: "openai" | "proxy" =
-    rawLlmProvider === "proxy" ? "proxy" : "openai";
+  const llmProvider: "openai" | "proxy" = !rawLlmProvider ? "openai" : rawLlmProvider === "proxy" ? "proxy" : "openai";
   const llm: StandaloneLLMConfig = {
     baseUrl: env("TDAI_LLM_BASE_URL") ?? str(llmConfig, "baseUrl") ?? "https://api.openai.com/v1",
     apiKey: env("TDAI_LLM_API_KEY") ?? str(llmConfig, "apiKey") ?? "",
